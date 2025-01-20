@@ -1,14 +1,145 @@
 from typing import List, Tuple
 
 import numpy as np
+import importlib
 
 from supervision.detection.core import Detections
 from supervision.detection.utils import box_iou_batch
 from supervision.tracker.byte_tracker import matching
 from supervision.tracker.byte_tracker.kalman_filter import KalmanFilter
+# importlib.reload(supervision.tracker.byte_tracker)
+from supervision.tracker.byte_tracker.nonlinear_kalman_filter import AdvancedNonLinearKalmanFilter
+from supervision.tracker.byte_tracker.kalman_filter_simplified import KalmanFilterS
 from supervision.tracker.byte_tracker.single_object_track import STrack, TrackState
 from supervision.tracker.byte_tracker.utils import IdCounter
+# importlib.reload(AdvancedNonLinearKalmanFilter)
+from scipy.optimize import linear_sum_assignment
 
+
+
+def interpolate_bboxes(bbox_prev, bbox_next, steps=1):
+    """
+    Interpolates bounding boxes between previous and current frame.
+
+    Args:
+        bbox_prev (np.ndarray): Bounding box of the previous frame in TLBR format.
+        bbox_next (np.ndarray): Bounding box of the current frame in TLBR format.
+        steps (int): Number of intermediate steps (frames) to interpolate.
+
+    Returns:
+        List[np.ndarray]: List of interpolated bounding boxes.
+    """
+    if steps > 1:
+        return [
+            bbox_prev + (bbox_next - bbox_prev) * (i / steps) for i in range(1, steps)
+        ]
+    else:
+        return [bbox_next]  # If steps == 1, no interpolation, return the next bbox directly
+    
+def detections2boxes(detections: Detections) -> np.ndarray:
+    """
+    Convert Supervision Detections to numpy tensors for further computation.
+    Args:
+        detections (Detections): Detections/Targets in the format of sv.Detections.
+    Returns:
+        (np.ndarray): Detections as numpy tensors as in
+            `(x_min, y_min, x_max, y_max, confidence, class_id)` order.
+    """
+    return np.hstack(
+        (
+            detections.xyxy,
+            detections.confidence[:, np.newaxis],
+            detections.class_id[:, np.newaxis],
+        )
+    )
+
+def compute_iou(bbox1, bbox2):
+    """Compute the Intersection over Union (IoU) of two bounding boxes."""
+    x1, y1, x2, y2 = bbox1
+    x1_t, y1_t, x2_t, y2_t = bbox2
+
+    # Calculate area of both bounding boxes
+    area_bbox1 = (x2 - x1) * (y2 - y1)
+    area_bbox2 = (x2_t - x1_t) * (y2_t - y1_t)
+
+    # Calculate the coordinates of the intersection box
+    x1_int = max(x1, x1_t)
+    y1_int = max(y1, y1_t)
+    x2_int = min(x2, x2_t)
+    y2_int = min(y2, y2_t)
+
+    # Calculate area of intersection
+    intersection_area = max(0, x2_int - x1_int) * max(0, y2_int - y1_int)
+
+    # Calculate IoU
+    iou = intersection_area / float(area_bbox1 + area_bbox2 - intersection_area)
+    return iou
+
+
+def calculate_center(bbox):
+    x1, y1, x2, y2 = bbox
+    center_x = (x1 + x2) / 2
+    center_y = (y1 + y2) / 2
+    return np.array([center_x, center_y])
+
+def compute_distance(center1, center2):
+    return np.linalg.norm(center1 - center2)
+
+def compute_cost_matrix(previous_bboxes, current_bboxes, image_width, image_height):
+    cost_matrix = np.full((len(previous_bboxes), len(current_bboxes)), float(1e6))
+    
+    image_diagonal = np.sqrt(image_width**2 + image_height**2)  # Calculate the diagonal of the image
+    
+    for i, bbox_prev in enumerate(previous_bboxes):
+        center_prev = calculate_center(bbox_prev)
+        
+        for j, bbox_curr in enumerate(current_bboxes):
+            center_curr = calculate_center(bbox_curr)
+            
+            # Compute IoU
+            # iou = [0,1] : 1 is perfect matching
+            iou = compute_iou(bbox_prev, bbox_curr)
+            iou_cost = 1 - iou  # Cost based on IoU
+            
+            # Compute Distance
+            distance = compute_distance(center_prev, center_curr)
+            distance_normalized = distance / image_diagonal  # Normalize the distance
+
+            # normalized distance in range [0,1] : 1 is furthest away
+            # In a 480 x 480 image, 30fps, a paper moved 38 pixels in one frame
+            # max a paper can move across 1 frame is lets say 48 pixels, so normalize distance is 0.1
+
+            if iou >= 0.1 and distance_normalized <= 0.1:
+                # Weight factors for IoU and Distance
+                alpha = 0.5  # IoU weight
+                beta = 0.5  # Distance weight
+                
+                # Compute final cost combining IoU and distance
+                final_cost = alpha * iou_cost + beta * distance_normalized
+                cost_matrix[i, j] = final_cost
+            
+            ####### CHECK TO SEE IF THIS IS A GOOD METRIC ########
+              # Apply IoU threshold
+            # if iou < iou_threshold:
+            #     cost_matrix[i, j] = float('inf')  # Reject if IoU is below threshold
+            # # Apply Distance threshold
+            # elif dist > distance_threshold:
+            #     cost_matrix[i, j] = float('inf')  # Reject if distance is too large
+            # else:
+            #     cost_matrix[i, j] = 1 - iou  # Use IoU for cost calculation
+
+
+    return cost_matrix
+
+def assign_bboxes(previous_bboxes, current_bboxes, current_scores, current_class_ids, cost_matrix):
+    # Use the Hungarian algorithm to find the optimal assignment (minimizing cost)
+    row_indices, col_indices = linear_sum_assignment(cost_matrix)
+    ########### TODO ###########
+    ## Figure out a threshold to not match if the distances or IoU are too large
+
+    # Create the zipped list of matched bounding boxes
+    matches = [(previous_bboxes[i], current_bboxes[j], current_scores[j], current_class_ids[j]) for i, j in zip(row_indices, col_indices)]
+    return matches
 
 class ByteTrack:
     """
@@ -64,6 +195,12 @@ class ByteTrack:
         self.internal_id_counter = IdCounter()
         self.external_id_counter = IdCounter(start_id=1)
 
+        self.total_tracked_tracks = 0
+        self.fps = 10
+        self.previous_bboxes = None
+        self.image_width = 480
+        self.image_height = 480
+    
     def update_with_detections(self, detections: Detections) -> Detections:
         """
         Updates the tracker with the provided detections and returns the updated
@@ -109,8 +246,85 @@ class ByteTrack:
                 detections.confidence[:, np.newaxis],
             )
         )
-        tracks = self.update_with_tensors(tensors=tensors)
 
+        ###########################################################################################
+
+        # custom_tensors = detections2boxes(detections=detections)
+
+        # current_bboxes = np.array([det[:4] for det in custom_tensors])  # Current frame's bounding boxes
+        # print("current_bboxes: ", current_bboxes)
+        # # calculate area of bboxes
+        # # Calculate area for each bounding box
+        # # areas = (current_bboxes[:, 2] - current_bboxes[:, 0]) * (current_bboxes[:, 3] - current_bboxes[:, 1])
+
+        # # # Store areas with the current_bboxes as extra column
+        # # bboxes_with_area = np.hstack([current_bboxes, areas.reshape(-1, 1)])
+
+        # current_scores = np.array([det[4] for det in custom_tensors])   # Current frame's confidence scores
+        # current_class_ids = np.array([det[5] for det in custom_tensors]) # Current frame's class IDs
+        # print("current class ID: ", current_class_ids)
+        # tracks = []
+
+        # # If this is not the first frame and the FPS is lower than 20, interpolate
+        # if self.previous_bboxes is not None:
+        #     if len(detections.xyxy)==0:
+        #         print("no detections but has previous boxes")
+        #         tracks = self.update_with_tensors(tensors=tensors)
+        #     # Check the FPS to determine whether to perform interpolation
+        #     if self.fps == 20:
+        #         steps = 5 ##3  # Perform two interpolations (between previous and current frame)
+        #         ##if steps = 2, then only one interpolation is done
+        #     else:
+        #         steps = 1  # No interpolation if FPS is 20 or higher
+            
+        #     # Create a cost matrix based on IoU and distance
+        #     # assign pairs of current and previous bboxes using the hungarian matching algorithm for closeness in distance and size
+        #     cost_matrix =  compute_cost_matrix(self.previous_bboxes, current_bboxes, self.image_width, self.image_height)
+        #     print(cost_matrix)
+        #     # if no matches: cost_matrix is inf:
+        #     if np.all(cost_matrix == float('inf')):
+        #         print("No valid matches, reinitializing tracking.")
+        #         # Handle by resetting tracks or choosing fallback behavior
+        #         # tracks = []  # or do some other fallback action
+        #         tracks = self.update_with_tensors(tensors=tensors)
+        #     else:
+        #         # List to hold all fake detections
+        #         all_fake_detections = []
+
+        #         matched_bboxes = assign_bboxes(self.previous_bboxes, current_bboxes, current_scores, current_class_ids, cost_matrix) 
+        #         for prev_bbox, curr_bbox, score, class_id in matched_bboxes:
+        #             interpolated_bboxes = interpolate_bboxes(prev_bbox, curr_bbox, steps) 
+        #             print("Interpolated Boxes: ", interpolated_bboxes)
+        #             print("bbox prev: ", prev_bbox)
+        #             print("bbox next: ", curr_bbox)
+                    
+        #             for bbox in interpolated_bboxes:
+        #                 print("bbbox: ", bbox)
+        #                 # Here, use the Kalman filter to predict and update with the interpolated positions
+        #                 # print(("score: ", score))
+        #                 fake_detection = np.hstack([bbox, 1.0, class_id])  # Create a fake detection with a confidence of 1.0
+        #                 fake_detections = np.expand_dims(fake_detection, axis=0)
+        #                 print(fake_detections)
+        #                 all_fake_detections.append(fake_detection)
+
+        #         all_fake_detections_array = np.array(all_fake_detections)
+        #         # run update on fake detections once
+        #         tracks = self.update_with_tensors(all_fake_detections_array)
+        
+        # # elif len(detections.xyxy)==0:
+        # #     print("no detections")
+        # #     tracks = []
+        
+        # else: 
+        #     print("no previous boxes")
+        #     tracks = self.update_with_tensors(tensors=tensors)
+        # self.previous_bboxes = current_bboxes
+    
+        # #################################################################################################
+        
+        tracks = self.update_with_tensors(tensors=tensors)
+        # print("grabbing")
+        
         if len(tracks) > 0:
             detection_bounding_boxes = np.asarray([det[:4] for det in tensors])
             track_bounding_boxes = np.asarray([track.tlbr for track in tracks])
@@ -178,6 +392,8 @@ class ByteTrack:
         dets = bboxes[remain_inds]
         scores_keep = scores[remain_inds]
         scores_second = scores[inds_second]
+        # print("detected elements: ", len(scores))
+        # print("detected elements kept: ", len(scores_keep) + len(scores_second))
 
         if len(dets) > 0:
             """Detections"""
@@ -204,6 +420,11 @@ class ByteTrack:
                 unconfirmed.append(track)
             else:
                 tracked_stracks.append(track)
+
+        # print("unconfirmed: ", unconfirmed)
+        # print("tracked tracks: ", tracked_stracks)
+
+        self.tracked_tracks += tracked_stracks
 
         """ Step 2: First association, with high score detection boxes"""
         strack_pool = joint_tracks(tracked_stracks, self.lost_tracks)
